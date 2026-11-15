@@ -1,87 +1,23 @@
-# free-model-aggregator-02's Python starter kit: one server, two client wires, and a real free model
-# behind every answer. It is the Python twin of main.ts beside it: same lifecycle, same routes, same
-# catalog, same deliberate weaknesses, written in the idiom of Python 3.13's standard library.
+# free-model-aggregator-02 — live free-model aggregator (Python, stdlib only)
 #
-# This is a working entry to start from, not a competitive answer. It is the house baseline for the
-# bounty, deliberately weak, and worth a fraction of the score: use it to see the shape of a trial, then
-# replace its routing, its failover and its catalog with your own. The gaps are marked TODO below.
+# One server, two client wires (OpenAI + Anthropic), one gateway. Every answer
+# comes from a real free model dialled through $OPENAI_BASE_URL; this file never
+# answers from itself. Routing is rating-ordered: the highest-rated free model
+# that meets a prompt's requirements serves it (inkling-2-small 1475 for plain /
+# streaming / tools prompts, nemotron-3.5-super-vl 1303 for JSON-mode prompts),
+# with one same-model retry and one failover per prompt, a per-model cooldown
+# inside the trial, and the failures trail on the x-makefun-upstream-failures
+# header. Deterministic: no wall clock, no unseeded random, fixed `created`
+# values; every choice is a pure function of the brief, the request, and the
+# refusals seen so far.
 #
-# HOW A TRIAL RUNS THIS FILE (read this before your first import)
-#   A trial runs this server as `python3 -P -s /bot/main.py` from your repository's root, on Python 3.13,
-#   with PYTHONHASHSEED=0. Nothing is installed: the standard library alone is importable. The two flags
-#   are the whole import story, and they are why Python entries boot-failed at 15.5% on the forge bounty
-#   while Node's failed at 0.67%, almost all of it ModuleNotFoundError:
-#     -P  does not add the script's own directory (/bot) to sys.path. `import providers` will NOT find a
-#         providers.py sitting beside main.py. A sibling module needs its own package, or this line before
-#         the import:
-#             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-#         This file keeps every helper in this one file, so it needs no such line and cannot forget one.
-#     -s  does not add the user site-packages directory to sys.path, so a package installed with
-#         `pip install --user` is not importable either. Vendor what you need into the repository and add
-#         its directory to sys.path yourself, if you must; the standard library is the safe floor.
-#   -I is deliberately not used: it implies -E, which would ignore PYTHONHASHSEED=0, and the harness sets
-#   that so str hashing (and with it the iteration order of sets of strings) is the same in every run.
-#
-# WHAT A TRIAL GIVES YOU
-#   A trial runs this server as `python3 -P -s /bot/main.py` from your repository's root, with Python
-#   3.13's standard library alone (nothing is installed; see above). The env is at $MAKEFUN_ENV_URL; your
-#   model calls go through the grader's gateway at $OPENAI_BASE_URL, an OpenAI-compatible endpoint that
-#   reaches OpenRouter on the key you pushed to the competition. The brief at $MAKEFUN_PROMPT_FILE carries
-#   two documents:
-#     - the free model list: each free OpenRouter model's gateway id
-#       (`openrouter/<vendor>/<model>:free`), its published rating in milli-points, what it can do
-#       (tools, vision, JSON mode, context length) and its free flag;
-#     - the six prompts: each one's id, its api (openai or anthropic), whether it streams, its weight
-#       (1 or 2) and the requirements a model must meet to serve it. Each prompt carries a unique token
-#       the answer must contain.
-#   The server:
-#     1. listens on 0.0.0.0 at a free port (never 8080: the env itself is there on one layout);
-#     2. POSTs $MAKEFUN_ENV_URL/register {"protocol_version": 1, "port": <port>, "catalog": <catalog>};
-#     3. serves GET /v1/models (answering in the shape of the auth header it got: x-api-key means
-#        Anthropic, Authorization means OpenAI), POST /v1/chat/completions and POST /v1/messages, each
-#        with a JSON body or with server-sent events;
-#     4. answers each prompt by dialling ONE free model through the gateway. OPENAI_API_KEY in the
-#        sandbox is a dummy the gateway swaps for the OpenRouter key you pushed; the real key never
-#        enters the sandbox;
-#     5. polls GET $MAKEFUN_ENV_URL/work every 100 ms and exits 0 when the env says {"done": true}. A
-#        process still running when the wall ends scores zero, so never wait for anything else.
-#   `python3 main.py --list` prints the same catalog JSON and exits 0 before any server starts; the
-#   register body's catalog is that same document, byte for byte.
-#
-# THE MODEL RULE
-#   Whatever this server reports in a response's `model` field must be the model it actually dialled.
-#   The house records every gateway call and scores the model that really answered. This starter sends
-#   the brief's model id in the gateway request and puts that same id back on every answer and every
-#   streamed chunk (the provider's own answer spells it without the gateway's `openrouter/` prefix), so
-#   its claim is the call it made, never another. A prompt whose reported model has no matching
-#   successful call in the house's record earns nothing.
-#
-# THE BASELINE'S WEAKNESSES (each is a scoring component you can win)
-#   - quality (60%): it ignores the published ratings. It takes the first free model in the brief, in
-#     the brief's order, that can meet the request's requirements. TODO(quality): rank the free
-#     candidates by rating_milli at the prompt's requirements and prefer the best.
-#   - failover (10%): a gateway call answered with a 4xx or a 5xx becomes a 502 to the client, and that
-#     prompt is lost. TODO(failover): retry the prompt on the next free model that meets it, and count
-#     every call it costs, because the tie-break is the number of gateway calls.
-#   - rate limits: after a 429 it keeps picking the same first model, so one rate-limited model takes
-#     every later prompt down with it. TODO(cooldowns): track each model's refusals and back off per
-#     model, and never spend a call on a model that is cooling down.
-#   - the catalog (5%): it lists every free model the brief names, which is exactly the fourteen ids
-#     this column scores. TODO(catalog): keep it exact — register that same set and answer GET /v1/models
-#     with it on both auth headers; the column checks the register body and both answers against exactly
-#     those fourteen ids, so listing fewer loses it as surely as listing more.
-#   The trial's rules are in the kit's RULES.txt; read them for the score's columns and the tie-break.
-#
-# FILES
-#   A repository holds one entrypoint: a Python entry keeps this main.py and not main.ts (a snapshot with
-#   both at its root is refused as ambiguous), and a Node entry keeps main.ts and not this file. This file
-#   is self-contained: lib/ belongs to the Node starter and nothing here imports it.
-#   main.py            this server: the brief, the catalog, the routes, the register and the poll (all of
-#                      it, in one file, because `-P` keeps /bot off sys.path).
-#   main.ts            the Node 22 twin of this file, beside lib/.
-#   lib/providers.ts   the brief's types and parser, the free model list, the catalog (Node).
-#   lib/wire.ts        Anthropic <-> Chat Completions translation, the model field, the SSE writers (Node).
-#   LICENSE            MIT: keep it or replace it with another OSI-approved license.
+# Trial lifecycle: listen on 0.0.0.0 at a free port, POST $MAKEFUN_ENV_URL/register
+# {protocol_version: 1, port, catalog}, serve GET /v1/models, POST
+# /v1/chat/completions and POST /v1/messages (JSON or SSE), poll GET
+# $MAKEFUN_ENV_URL/work every 100 ms and exit 0 when it says done.
+# `python3 main.py --list` prints the catalog and exits 0 before any server
+# starts. Runs as `python3 -P -s main.py` on Python 3.13: everything lives in
+# this one file because -P keeps the script's directory off sys.path.
 
 import json
 import math
@@ -96,53 +32,42 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-# ---------------------------------------------------------------- the wire's constants
+# --- constants -----------------------------------------------------------------
 
-# The wire protocol's version, in the register body.
-PROTOCOL_VERSION = 1
-# How often GET /work is polled, in seconds.
-POLL_INTERVAL_SEC = 0.1
-# The most bytes of one client request body this baseline reads.
-MAX_BODY_BYTES = 8 * 1024 * 1024
+PROTOCOL_VERSION = 1            # register body's wire version
+POLL_INTERVAL_SEC = 0.1         # GET /work poll cadence
+MAX_BODY_BYTES = 8 * 1024 * 1024  # largest client request body accepted
 
 ENV_URL = os.environ.get('MAKEFUN_ENV_URL', '').rstrip('/')
 PROMPT_FILE = os.environ.get('MAKEFUN_PROMPT_FILE', '')
 GATEWAY_URL = os.environ.get('OPENAI_BASE_URL', '').rstrip('/')
-# The trial's dummy key for the entry's gateway lane; the gateway swaps it for the entrant's own key.
+# Dummy key for the trial's gateway lane; the gateway swaps it for the entrant's key.
 GATEWAY_KEY = os.environ.get('OPENAI_API_KEY', '')
 
 MODELS_SCHEMA = 'free-model-aggregator-02/models/v1'
 PROMPTS_SCHEMA = 'free-model-aggregator-02/prompts/v1'
-# Every schema this contest's brief writes names this prefix; the brief's JSON is found by it.
 SCHEMA_PREFIX = 'free-model-aggregator-02/'
 
-# The public base URL of the provider the free models belong to: the endpoint the gateway reaches for
-# them. It is spelled in two pieces because the repository's provider-host guard (tests/unit/
-# masq-only.test.ts NAMED_HOSTS) allows this host only in lib/providers.ts, the Node twin that builds
-# the same document; the value is the same string, and this file never dials it (the gateway is dialled
-# at $OPENAI_BASE_URL).
+# Provider's public base URL, spelled in pieces (never dialled: the gateway is).
 OPENROUTER_PUBLIC_BASE = 'https://' + 'openrouter' + '.ai/api/v1'
-# The environment variable an entrant's OpenRouter key is pushed under (kept out of the sandbox).
 OPENROUTER_KEY_ENV = 'OPENROUTER_API_KEY'
 
-# A fixed epoch second for every listed model's `created`: nothing in the reply reads the clock.
+# Fixed creation values: nothing in any reply reads the clock.
 FIXED_OPENAI_CREATED = 1767225600
-# A fixed instant for every listed model's `created_at`: nothing in the reply reads the clock.
 FIXED_ANTHROPIC_CREATED_AT = '2026-01-01T00:00:00Z'
 
-# Shorthand for the JSON objects this file moves around: one JSON object, as Python reads it.
-Json = dict[str, object]
+Json = dict[str, object]  # one JSON object, as Python reads it
 
-# ---------------------------------------------------------------- small type checks
 
+# --- small type checks ---------------------------------------------------------
 
 def is_record(value: object) -> bool:
-    """A JSON object (a Python dict), never an array or another value."""
+    """A JSON object (a dict), never an array or another value."""
     return isinstance(value, dict)
 
 
 def is_number(value: object) -> bool:
-    """A JSON number: an int or a float, never a bool (Python's bool is an int)."""
+    """A JSON number: int or float, never a bool (Python's bool is an int)."""
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
@@ -162,11 +87,10 @@ def bool_or_null(value: object) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
-# ---------------------------------------------------------------- the brief's documents
-
+# --- reading the brief ---------------------------------------------------------
 
 def object_end(text: str, start: int) -> int:
-    """The index of the `}` closing the object that opens at `start`, or -1; string contents skipped."""
+    """Index of the `}` closing the object that opens at `start`, or -1."""
     depth = 0
     in_string = False
     i = start
@@ -191,7 +115,7 @@ def object_end(text: str, start: int) -> int:
 
 
 def documents_in(text: str) -> list[Json]:
-    """Every JSON object in `text` that carries a string `schema`, in the order they appear."""
+    """Every JSON object in `text` that carries a string `schema`, in order."""
     out: list[Json] = []
     start = text.find('{')
     while start != -1:
@@ -208,7 +132,7 @@ def documents_in(text: str) -> list[Json]:
 
 
 def array_document(docs: list[Json], keys: tuple[str, ...]) -> tuple[Json, str] | None:
-    """The first document under this contest's prefix that carries one of `keys` as an array."""
+    """First document under this contest's prefix carrying one of `keys` as an array."""
     for doc in docs:
         schema = string_of(doc.get('schema'))
         if SCHEMA_PREFIX not in schema:
@@ -220,7 +144,7 @@ def array_document(docs: list[Json], keys: tuple[str, ...]) -> tuple[Json, str] 
 
 
 def model_of(value: object) -> Json | None:
-    """One model row, as this baseline reads it. A free row is routed as the gateway spells its id."""
+    """One model row. A free row is routed as the gateway spells its id."""
     if not is_record(value):
         return None
     raw = string_of(value.get('id'))
@@ -248,7 +172,7 @@ def model_of(value: object) -> Json | None:
 
 
 def prompt_of(value: object) -> Json | None:
-    """One prompt row, as this baseline reads it."""
+    """One prompt row."""
     if not is_record(value):
         return None
     prompt_id = string_of(value.get('id'))
@@ -270,10 +194,10 @@ def prompt_of(value: object) -> Json | None:
 
 
 def read_brief(path: str) -> Json:
-    """The brief at `path`, its two documents found under this contest's schema prefix.
+    """The brief at `path`: {"models": [...], "prompts": [...], "error": str|None}.
 
-    Returns {"models": [...], "prompts": [...], "error": <string or None>}. The brief's own prose is
-    never parsed: each document is found by the `schema` member under this contest's prefix.
+    Only the two documents under this contest's schema prefix are read; the
+    brief's prose is never parsed.
     """
     if path == '':
         return {'models': [], 'prompts': [], 'error': 'MAKEFUN_PROMPT_FILE is not set'}
@@ -295,7 +219,7 @@ def read_brief(path: str) -> Json:
 
 
 def free_models(brief: Json) -> list[Json]:
-    """The models this entry may serve: the brief's free ones, in the brief's order."""
+    """The brief's free models, in the brief's order."""
     return [m for m in brief['models'] if m['free']]
 
 
@@ -309,7 +233,10 @@ def capabilities_of(model: Json) -> Json:
 
 
 def meets_requirements(requires: Json, caps: Json) -> bool:
-    """Whether a model's capabilities meet one prompt's requirements. An unknown capability never meets one."""
+    """Whether a model's capabilities meet a prompt's requirements.
+
+    An unknown capability never meets one.
+    """
     if requires.get('tools') is True and caps['tools'] is not True:
         return False
     if requires.get('vision') is True and caps['vision'] is not True:
@@ -321,10 +248,10 @@ def meets_requirements(requires: Json, caps: Json) -> bool:
         return False
     return True
 
-
-# The sealed fourteen free models, exactly as every practice brief lists them (id, rating,
-# context, capabilities). Used only when the brief at MAKEFUN_PROMPT_FILE names no model, so
-# --list and routing stay exact outside a trial; inside a trial the brief's own rows win.
+# The sealed fourteen free models, exactly as every practice brief lists them
+# (id, rating, context, capabilities). Used only when the brief at
+# MAKEFUN_PROMPT_FILE names no model, so --list and routing stay exact outside
+# a trial; inside a trial the brief's own rows win.
 SEALED_MODELS: list[Json] = [
     {'id': 'openrouter/baidu/ernie-5.5-flash-preview:free', 'provider': 'openrouter', 'display_name': 'Baidu: ERNIE-5.5-Flash-Preview (free)', 'rating_milli': 1150, 'context_length': 1024000, 'tools': True, 'vision': False, 'json': True, 'free': True},
     {'id': 'openrouter/cohere/north-mini-code:free', 'provider': 'openrouter', 'display_name': 'Cohere: North Mini Code (free)', 'rating_milli': 1200, 'context_length': 256000, 'tools': True, 'vision': False, 'json': False, 'free': True},
@@ -352,13 +279,11 @@ def all_models(brief: Json) -> list[Json]:
 def build_catalog(brief: Json) -> Json:
     """The catalog the brief's free model list makes: one provider, the models it serves.
 
-    The base_url is the provider's public endpoint, never the gateway's trial-local address: the gateway's
-    origin differs between a live pass and its replay, and the catalog is part of the state export a
-    replay must reproduce byte for byte.
-
-    When the brief names no model (run outside a trial, e.g. `--list` with no brief), the sealed
-    fourteen ids are used instead: they are identical in every practice trial's brief, so the catalog
-    stays exact rather than empty.
+    The base_url is the provider's public endpoint, never the gateway's
+    trial-local address: the gateway's origin differs between a live pass and
+    its replay, and the catalog is part of the state export a replay must
+    reproduce byte for byte. When the brief names no model (run outside a trial,
+    e.g. `--list` with no brief), the sealed fourteen ids are used instead.
     """
     seen: set[str] = set()
     models: list[Json] = []
@@ -383,11 +308,10 @@ def build_catalog(brief: Json) -> Json:
     }
 
 
-# ---------------------------------------------------------------- the client wires and the model field
-
+# --- the client wires and the model field --------------------------------------
 
 def openai_model_list(models: list[Json]) -> Json:
-    """GET /v1/models on an OpenAI-shaped request: the models this entry serves, in OpenAI's list shape."""
+    """GET /v1/models on an OpenAI-shaped request: OpenAI's list shape."""
     return {
         'object': 'list',
         'data': [{'id': m['id'], 'object': 'model', 'created': FIXED_OPENAI_CREATED, 'owned_by': m['provider']} for m in models],
@@ -395,7 +319,7 @@ def openai_model_list(models: list[Json]) -> Json:
 
 
 def anthropic_model_list(models: list[Json]) -> Json:
-    """GET /v1/models on an Anthropic-shaped request (an x-api-key header): Anthropic's model list shape."""
+    """GET /v1/models on an Anthropic-shaped request (an x-api-key header)."""
     return {
         'data': [{'type': 'model', 'id': m['id'], 'display_name': m['display_name'], 'created_at': FIXED_ANTHROPIC_CREATED_AT} for m in models],
         'has_more': False,
@@ -423,7 +347,7 @@ def text_of(content: object) -> str:
 
 
 def part_of(block: Json) -> Json | None:
-    """One Anthropic content block as an OpenAI content part: text or an inline image; None for the rest."""
+    """One Anthropic content block as an OpenAI content part: text or inline image; None for the rest."""
     if block.get('type') == 'text' and isinstance(block.get('text'), str):
         return {'type': 'text', 'text': block['text']}
     source = block.get('source')
@@ -437,7 +361,7 @@ def part_of(block: Json) -> Json | None:
 
 
 def tool_result_text(content: object) -> str:
-    """A tool_result block's content as text: its text blocks, or its JSON when it holds something else."""
+    """A tool_result block's content as text: its text blocks, or its JSON otherwise."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -472,13 +396,13 @@ def stop_reason_of(finish: object) -> str:
         return 'refusal'
     return 'end_turn'
 
-
 def anthropic_to_openai(body: Json, model: str) -> Json:
-    """An Anthropic Messages request as an OpenAI Chat Completions request that names `model`.
+    """An Anthropic Messages request as an OpenAI Chat Completions request naming `model`.
 
-    The system prompt becomes a system message, image blocks become image_url data URLs, tool_use blocks
-    become tool_calls, tool_result blocks become tool messages, tools and tool_choice are rewritten, and
-    the output cap, temperature, top_p, stop sequences and streaming pass through.
+    The system prompt becomes a system message, image blocks become image_url
+    data URLs, tool_use blocks become tool_calls, tool_result blocks become tool
+    messages, tools and tool_choice are rewritten, and the output cap,
+    temperature, top_p, stop sequences and streaming pass through.
     """
     messages: list[Json] = []
     system = text_of(body.get('system'))
@@ -580,7 +504,7 @@ def anthropic_to_openai(body: Json, model: str) -> Json:
 
 
 def openai_to_anthropic(body: Json, model: str) -> Json:
-    """A Chat Completions answer as an Anthropic Messages object. `model` is the id the entry dialled."""
+    """A Chat Completions answer as an Anthropic Messages object. `model` is the id dialled."""
     choices = body.get('choices') if isinstance(body.get('choices'), list) else []
     choice = choices[0] if choices and is_record(choices[0]) else {}
     message = choice.get('message') if is_record(choice.get('message')) else {}
@@ -620,17 +544,18 @@ def openai_to_anthropic(body: Json, model: str) -> Json:
 
 
 def openai_json_with_model(body: Json, model: str) -> Json:
-    """A Chat Completions answer with `model` set to the id the entry dialled: the one truthful claim."""
+    """A Chat Completions answer with `model` set to the id dialled: the one truthful claim."""
     return {**body, 'model': model}
 
 
 def whole_usage(parsed: Json) -> Json:
     """Usage the wire checks accept: input at least 0, output at least 1.
 
-    The provider's own counts pass through untouched. Only when a count is missing
-    or the output count is zero does the guard step in, estimating the output from
-    the answer's text length, so a provider that omits usage cannot fail the wire
-    column on its own. Never invents a larger claim than the answer supports.
+    The provider's own counts pass through untouched. Only when a count is
+    missing or the output count is zero does the guard step in, estimating the
+    output from the answer's text length, so a provider that omits usage cannot
+    fail the wire column on its own. Never invents a larger claim than the
+    answer supports.
     """
     usage = parsed.get('usage') if is_record(parsed.get('usage')) else {}
     prompt = number_or_zero(usage.get('prompt_tokens'))
@@ -655,11 +580,11 @@ def sse_event(event: str | None, data: object) -> str:
 
 
 def frame_with_model(frame: str, model: str) -> str:
-    """One SSE frame with every data payload's `model` set to `model`, and its blank line kept.
+    """One SSE frame with every data payload's `model` set to `model`, blank line kept.
 
-    Comments, `event:` lines and payloads that are not JSON objects pass through untouched. Chat
-    Completions names the model on its chunks; the client sees the id the entry dialled, never the
-    provider's spelling.
+    Comments, `event:` lines and payloads that are not JSON objects pass through
+    untouched. Chat Completions names the model on its chunks; the client sees
+    the id the entry dialled, never the provider's spelling.
     """
     lines: list[str] = []
     for line in frame.split('\n'):
@@ -684,10 +609,11 @@ def frame_with_model(frame: str, model: str) -> str:
 
 
 def iter_frames(chunks):
-    """SSE frames from an upstream body's byte chunks, split on the blank line that ends each one.
+    """SSE frames from an upstream body's byte chunks, split on the blank line ending each one.
 
-    A frame cut across reads is held until its end arrives, and a body that ends without one is yielded
-    as it is. CRLF is normalized to LF as the SSE grammar reads it.
+    A frame cut across reads is held until its end arrives, and a body that ends
+    without one is yielded as it is. CRLF is normalized to LF as the SSE grammar
+    reads it.
     """
     buffer = ''
     for chunk in chunks:
@@ -701,12 +627,11 @@ def iter_frames(chunks):
     if buffer.strip() != '':
         yield buffer
 
-
 def openai_stream_with_model(chunks, model: str):
-    """A Chat Completions SSE stream as it came, frame by frame, every data payload's `model` the dialled id.
+    """A Chat Completions SSE stream as it came, every data payload's `model` the dialled id.
 
-    The upstream's own [DONE] is held back and re-emitted once at the end: when the
-    stream carried no usage chunk, one is appended first (empty choices, the
+    The upstream's own [DONE] is held back and re-emitted once at the end: when
+    the stream carried no usage chunk, one is appended first (empty choices, the
     estimated usage), because the wire check reads usage from any chunk and a
     stream without it fails the usage check outright. A stream cut short without
     [DONE] is still closed properly.
@@ -751,9 +676,9 @@ def openai_stream_with_model(chunks, model: str):
 def anthropic_events_from_openai(chunks, model: str):
     """A Chat Completions SSE stream as the Anthropic event sequence.
 
-    message_start on the first chunk, content_block_start/delta/stop per text block or tool call, then
-    message_delta with the stop reason and usage, then message_stop. `model` is the id the entry dialled,
-    named back to the client.
+    message_start on the first chunk, content_block_start/delta/stop per text
+    block or tool call, then message_delta with the stop reason and usage, then
+    message_stop. `model` is the id the entry dialled, named back to the client.
     """
     started = False
     finished = False
@@ -912,8 +837,7 @@ def anthropic_events_from_openai(chunks, model: str):
         for event in finish_events(pending_stop if pending_stop is not None else 'end_turn'):
             yield event
 
-
-# ---------------------------------------------------------------- the trial state
+# --- the trial state -----------------------------------------------------------
 
 BRIEF = read_brief(PROMPT_FILE)
 CATALOG = build_catalog(BRIEF)
@@ -930,8 +854,9 @@ def log(message: str) -> None:
 def chat_completions_url() -> str:
     """The gateway's Chat Completions route.
 
-    OPENAI_BASE_URL is the OpenAI-compatible root (`…/v1` on the trial network); a base that does not
-    already end in `/v1` gets one, so both spellings reach the route.
+    OPENAI_BASE_URL is the OpenAI-compatible root (`…/v1` on the trial network);
+    a base that does not already end in `/v1` gets one, so both spellings reach
+    the route.
     """
     if GATEWAY_URL == '':
         return ''
@@ -943,9 +868,10 @@ def served_models() -> list[Json]:
     return [{'id': m['id'], 'provider': m['provider'], 'display_name': m['display_name']} for m in all_models(BRIEF)]
 
 
-# Models that answered a 429/5xx in this trial: skipped for later prompts while a
-# near-rated alternative exists, so one rate-limited model cannot take every later
-# prompt down with it. A set, never a timestamp: the choice must be replay-identical.
+# Models that answered a 429/5xx in this trial: skipped for later prompts while
+# a near-rated alternative exists, so one rate-limited model cannot take every
+# later prompt down with it. A set, never a timestamp: the choice must be
+# replay-identical.
 cooled_down: set[str] = set()
 cooled_lock = threading.Lock()
 
@@ -958,9 +884,9 @@ def mark_cooled(model_id: str) -> None:
 def candidates_for(requires: Json) -> list[Json]:
     """Free models meeting `requires`, best rating first, brief order breaking ties.
 
-    Cooled-down models sort last (they are still usable when nothing else is left);
-    within each group the order is rating desc, then the brief's order, so the
-    choice is a pure function of the brief and the refusals seen so far.
+    Cooled-down models sort last (they are still usable when nothing else is
+    left); within each group the order is rating desc, then the brief's order,
+    so the choice is a pure function of the brief and the refusals seen so far.
     """
     eligible = [m for m in all_models(BRIEF) if meets_requirements(requires, capabilities_of(m))]
     with cooled_lock:
@@ -971,10 +897,10 @@ def candidates_for(requires: Json) -> list[Json]:
 def route_for(requires: Json) -> Json | None:
     """The one free model that serves a request: the highest-rated candidate meeting it.
 
-    Quality is 60% of the score and is the rating of the model that really served each
-    prompt over the best rating meeting that prompt's requirements, so the first
-    candidate is the whole quality play: inkling-2-small (1475) for plain, streaming
-    and tools prompts, nemotron-3.5-super-vl (1303) for JSON-mode prompts.
+    Quality is 60% of the score and is the rating of the model that really served
+    each prompt over the best rating meeting that prompt's requirements, so the
+    first candidate is the whole quality play: inkling-2-small (1475) for plain,
+    streaming and tools prompts, nemotron-3.5-super-vl (1303) for JSON-mode prompts.
     """
     ranked = candidates_for(requires)
     return ranked[0] if ranked else None
@@ -1020,8 +946,7 @@ def requirements_from_body(body: Json) -> Json:
     return {'tools': isinstance(body.get('tools'), list) and len(body['tools']) > 0, 'vision': vision, 'json': response_type in ('json_object', 'json_schema')}
 
 
-# ---------------------------------------------------------------- the gateway
-
+# --- the gateway ---------------------------------------------------------------
 
 class Upstream:
     """One gateway answer: its status and a body that may be read whole or as byte chunks."""
@@ -1057,7 +982,7 @@ class Upstream:
 
 
 def dial(model: str, body: Json) -> Upstream:
-    """POST one request to the gateway's Chat Completions route, naming the model this entry dialled."""
+    """POST one request to the gateway's Chat Completions route, naming the model dialled."""
     url = chat_completions_url()
     if url == '':
         raise RuntimeError('OPENAI_BASE_URL is not set')
@@ -1077,7 +1002,7 @@ def dial(model: str, body: Json) -> Upstream:
     return Upstream(response.status, response)
 
 
-# ---------------------------------------------------------------- failover (max 2 recovery steps per prompt)
+# --- failover (max 2 recovery steps per prompt) --------------------------------
 
 # Seconds waited before the same-model retry: a fixed constant, never a clock reading.
 RETRY_PAUSE_SEC = 1.0
@@ -1088,10 +1013,10 @@ DEFAULT_UPSTREAM_TOKENS = 512
 def upstream_body(body: Json) -> Json:
     """The body as the gateway must receive it: an output cap is always named.
 
-    The gateway refuses a request with no max_tokens, or one over 8192. The client
-    always sends one in practice; when it does not, 512 is the default, and a cap
-    over 8192 is clamped rather than refused. A streaming request asks for its
-    usage chunk, which the wire checks read.
+    The gateway refuses a request with no max_tokens, or one over 8192. The
+    client always sends one in practice; when it does not, 512 is the default,
+    and a cap over 8192 is clamped rather than refused. A streaming request asks
+    for its usage chunk, which the wire checks read.
     """
     out = dict(body)
     cap = body.get('max_tokens')
@@ -1135,12 +1060,13 @@ def error_code_of(text: str) -> str:
 def dial_with_recovery(requires: Json, body: Json) -> tuple[Json | None, Upstream | None, list[Json]]:
     """Dial the best model for `requires`, recovering from refusals within the budget.
 
-    At most 2 recovery steps per prompt: one retry on the same model for a 429/5xx,
-    then one failover to the next-best model meeting the requirements. A 401 gives
-    up at once (a failover would be refused the same way). Every refused model is
-    cooled down for later prompts. Returns (model, upstream, failures) where
-    `failures` is the trail for the x-makefun-upstream-failures header, in the order
-    the calls refused; model/upstream are None when the prompt was not served.
+    At most 2 recovery steps per prompt: one retry on the same model for a
+    429/5xx, then one failover to the next-best model meeting the requirements.
+    A 401 gives up at once (a failover would be refused the same way). Every
+    refused model is cooled down for later prompts. Returns (model, upstream,
+    failures) where `failures` is the trail for the x-makefun-upstream-failures
+    header, in the order the calls refused; model/upstream are None when the
+    prompt was not served.
     """
     ranked = candidates_for(requires)
     if not ranked:
@@ -1188,9 +1114,7 @@ def dial_with_recovery(requires: Json, body: Json) -> tuple[Json | None, Upstrea
                 continue
         return None, None, failures
 
-
-# ---------------------------------------------------------------- the HTTP server
-
+# --- the HTTP server -----------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
     """The entry's one server: the models route, the two completion wires, and nothing else."""
@@ -1209,7 +1133,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # the base class's name
         self.dispatch()
 
-    # -- plumbing -----------------------------------------------------------------------------------
+    # -- plumbing ---------------------------------------------------------------
 
     def dispatch(self) -> None:
         self.headers_sent = False
@@ -1304,7 +1228,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_error_body(wire, 502, 'upstream_error', f'the gateway answered HTTP {status}{suffix}')
 
-    # -- the routes ---------------------------------------------------------------------------------
+    # -- the routes ---------------------------------------------------------------
 
     def models(self) -> None:
         """GET /v1/models, in the shape of the auth header the client sent."""
@@ -1402,8 +1326,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, openai_to_anthropic(parsed, route['id']), trail)
 
 
-# ---------------------------------------------------------------- register and poll
-
+# --- register and poll -----------------------------------------------------------
 
 def register(port: int, report: Json) -> None:
     """POST /register with the port and the one catalog; the env answers with the trial's prompt count."""
@@ -1446,8 +1369,7 @@ def poll() -> None:
             os._exit(0)
 
 
-# ---------------------------------------------------------------- start
-
+# --- start -----------------------------------------------------------------------
 
 def stop(*_: object) -> None:
     """SIGTERM and SIGINT end the trial as Node's process.exit(0) does: exit 0, at once."""
