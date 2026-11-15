@@ -753,18 +753,61 @@ def sse_event(event: str | None, data: object) -> str:
 def sse_frames(chunks):
     """SSE frames from an upstream body's byte chunks, split on the blank line ending each one.
 
-    A frame cut across reads is held until its end arrives, and a body that ends
-    without one is yielded as it is. CRLF is normalized to LF as the SSE grammar
-    reads it.
+    Nothing is parsed from a single read: bytes accumulate until a whole line
+    has arrived, because a read may end inside a CRLF pair or inside a
+    multi-byte character, and a frame cut at either place must not be parsed
+    half-formed. A line ends with LF, CRLF or CR; a blank line ends the frame.
+    The frames yielded are their lines joined with LF, as the SSE grammar
+    reads them. A body that ends mid-frame yields what arrived, as it stands.
     """
-    buffer = ''
+    pending = b''
+    lines: list[str] = []
+
+    def take_line(final: bool) -> bytes | None:
+        """The next complete line in `pending`, without its ending; None while it is still arriving."""
+        nonlocal pending
+        lf = pending.find(b'\n')
+        cr = pending.find(b'\r')
+        if lf == -1 and cr == -1:
+            return None
+        if cr != -1 and (lf == -1 or cr < lf):
+            # A CR ends the line, alone or as the first half of a CRLF pair; a
+            # CR that is the buffer's last byte may still gain its LF half
+            # from the next read, so it completes no line until then.
+            if cr + 1 == len(pending) and not final:
+                return None
+            width = 2 if cr + 1 < len(pending) and pending[cr + 1:cr + 2] == b'\n' else 1
+            cut = cr
+        else:
+            cut, width = lf, 1
+        line = pending[:cut]
+        pending = pending[cut + width:]
+        return line
+
     for chunk in chunks:
-        buffer += chunk.decode('utf-8', 'replace').replace('\r\n', '\n')
-        while '\n\n' in buffer:
-            frame, buffer = buffer.split('\n\n', 1)
-            yield frame
-    if buffer.strip() != '':
-        yield buffer
+        pending += chunk.encode('utf-8') if isinstance(chunk, str) else chunk
+        while True:
+            line = take_line(False)
+            if line is None:
+                break
+            if line == b'':
+                yield '\n'.join(lines)
+                lines = []
+            else:
+                lines.append(line.decode('utf-8', 'replace'))
+    while True:
+        line = take_line(True)
+        if line is None:
+            break
+        if line == b'':
+            yield '\n'.join(lines)
+            lines = []
+        else:
+            lines.append(line.decode('utf-8', 'replace'))
+    if pending != b'':
+        lines.append(pending.decode('utf-8', 'replace'))
+    if '\n'.join(lines).strip() != '':
+        yield '\n'.join(lines)
 
 
 def frame_data_payloads(frame: str) -> list[str]:
@@ -807,29 +850,61 @@ def frame_with_model(frame: str, model: str) -> str:
     return '\n'.join(lines) + '\n\n'
 
 
+def _chunk_is_finish(chunk: Json) -> bool:
+    """True when any choice of the chunk carries a finish_reason: the chunk ends the answer."""
+    choices = chunk.get('choices') if isinstance(chunk.get('choices'), list) else []
+    return any(is_obj(choice) and choice.get('finish_reason') is not None for choice in choices)
+
+
+def _chunk_is_usage_only(chunk: Json) -> bool:
+    """True for the trailing usage chunk: a usage object and no choices at all."""
+    choices = chunk.get('choices')
+    return is_obj(chunk.get('usage')) and isinstance(choices, list) and len(choices) == 0
+
+
 def openai_stream_with_model(chunks, model: str):
-    """A Chat Completions SSE stream as it came, every data payload's `model` the dialled id.
+    """A Chat Completions SSE stream normalized for the wire, every payload's `model` the dialled id.
 
     The upstream's own [DONE] is held back and re-emitted once at the end: when
     the stream carried no usage chunk, one is appended first (empty choices, the
     estimated usage), because the wire check reads usage from any chunk and a
     stream without it fails the usage check outright. A stream cut short without
     [DONE] is still closed properly.
+
+    The order is normalized on the way through, because a provider's stream is
+    not guaranteed to arrive in the order the wire checks demand: the first
+    finish chunk is the only one forwarded, a content delta or a second finish
+    after it is dropped, and after the finish only the empty-choices usage
+    chunk may still pass. What survives the filter is exactly one finish
+    chunk, then usage, then the entry's own [DONE].
     """
     usage_seen = False
     text_chars = 0
+    finish_seen = False
     for frame in sse_frames(chunks):
         payloads = frame_data_payloads(frame)
         if payloads == ['[DONE]']:
             continue
+        if not payloads:
+            # A frame with no data line (a comment, an event line) carries no
+            # answer; after the finish nothing but usage may pass at all.
+            if not finish_seen:
+                yield frame_with_model(frame, model)
+            continue
         for payload in payloads:
-            if payload == '':
+            if payload == '' or payload == '[DONE]':
                 continue
             try:
                 chunk = json.loads(payload)
             except (json.JSONDecodeError, ValueError):
-                continue
+                chunk = None
             if not is_obj(chunk):
+                if not finish_seen:
+                    yield frame_with_model(f'data: {payload}', model)
+                continue
+            if finish_seen and not _chunk_is_usage_only(chunk):
+                # Past the finish, only the usage chunk may still pass: a late
+                # content delta or a second finish fails the wire checks.
                 continue
             if is_obj(chunk.get('usage')):
                 usage_seen = True
@@ -838,7 +913,9 @@ def openai_stream_with_model(chunks, model: str):
                 delta = choices[0].get('delta') if is_obj(choices[0].get('delta')) else {}
                 if isinstance(delta.get('content'), str):
                     text_chars += len(delta['content'])
-        yield frame_with_model(frame, model)
+            if _chunk_is_finish(chunk):
+                finish_seen = True
+            yield frame_with_model(f'data: {payload}', model)
     if not usage_seen:
         output_tokens = max(1, text_chars // 4)
         usage_chunk = {
@@ -1185,7 +1262,7 @@ def dial(model: str, body: Json) -> Upstream:
     return Upstream(response.status, response)
 
 
-# --- failover (max 2 recovery steps per prompt) --------------------------------
+# --- failover (max 2 recovery steps per prompt, plus the 401 candidate chain) ---
 
 def _output_cap(body: Json) -> int:
     """The output cap the gateway must receive: the client's, clamped to 8192, else 512."""
@@ -1275,8 +1352,12 @@ def dial_with_recovery(requires: Json, body: Json) -> tuple[Json | None, Upstrea
 
     At most 2 recovery steps per prompt: one retry on the same model for a
     429/5xx, then one failover to the next-best model meeting the requirements.
-    A 401 gives up at once (a failover would be refused the same way). Every
-    refused model is cooled down for later prompts. Returns (model, upstream,
+    A 401 is the exception: it refuses the model, not the prompt — the key may
+    lack that one model while the next candidate still answers — so a 401
+    fails over to the next candidate and the prompt is given up only when
+    every candidate has refused (a key dead for all models still fails the
+    prompt, after each candidate has been tried once). Every refused model is
+    cooled down for later prompts. Returns (model, upstream,
     failures) where `failures` is the trail for the x-makefun-upstream-failures
     header, in the order the calls refused; model/upstream are None when the
     prompt was not served.
@@ -1295,9 +1376,15 @@ def dial_with_recovery(requires: Json, body: Json) -> tuple[Json | None, Upstrea
         upstream, outcome = _single_dial(attempt['id'], prepared, failures)
         if outcome == 'ok':
             return attempt, upstream, failures
+        if outcome == 'refused' and upstream.status == 401:
+            # This model refused the key; the next candidate may still take
+            # it. Chain through the untried candidates, best first.
+            rest = [m for m in ranked if m['id'] not in tried]
+            if rest:
+                attempt = rest[0]
+                continue
+            return None, None, failures
         if outcome == 'refused':
-            if upstream.status == 401:
-                return None, None, failures
             if not retried and upstream.status in (429, 500, 502, 503, 504):
                 # First refusal: one retry on the same model, after a fixed pause.
                 retried = True
